@@ -3,63 +3,186 @@ name: Deploy Orion API
 on:
   push:
     branches:
-      - '*'
+      - main
+      - fix/pipeline
+
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  deploy:
+
+  # ----------------------------
+  # Stage 1 - Source
+  # ----------------------------
+  source:
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Node
-        uses: actions/setup-node@v3
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          node-version: '16'
+          fetch-depth: 0
 
-      - name: Install dependencies
-        run: npm install
+      - name: Display Commit Information
+        run: |
+          echo "Commit SHA: $GITHUB_SHA"
+          echo "Branch: $GITHUB_REF"
+          echo "Timestamp: $(date)"
 
-      - name: Deploy to production
+  # ----------------------------
+  # Stage 2 - Build
+  # ----------------------------
+  build:
+    needs: source
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Lint
+        run: npm run lint
+
+      - name: Build Project
+        run: npm run build
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist
+
+  # ----------------------------
+  # Stage 3 - Test
+  # ----------------------------
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run Unit Tests
+        run: npm test -- --coverage --watchAll=false
+
+      - name: Run Integration Tests
+        run: npm run test:integration
+
+  # ----------------------------
+  # Stage 4 - Security
+  # ----------------------------
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Dependency Audit
+        run: npm audit --audit-level=high
+
+      - name: Secret Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified
+
+  # ----------------------------
+  # Stage 5A - Deploy Staging
+  # ----------------------------
+  deploy-staging:
+    needs: security
+    runs-on: ubuntu-latest
+
+    if: github.ref == 'refs/heads/main'
+
+    environment:
+      name: staging
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Deploy to Staging
+        run: |
+          echo "Deploying to staging..."
+          bash scripts/deploy.sh staging
+
+  # ----------------------------
+  # Stage 5B - Deploy Production
+  # ----------------------------
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+
+      - name: Deploy to Production
         env:
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
           DB_PASS: ${{ secrets.DB_PASS }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
-          echo "Deploying version $APP_VERSION to production..."
-          bash scripts/deploy.sh
+          echo "Deploying to Production..."
+          bash scripts/deploy.sh production
 
-      - name: Run smoke test
+  # ----------------------------
+  # Stage 6 - Verify
+  # ----------------------------
+  verify:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Health Check
         run: |
-          sleep 5
-          curl -f http://production.orion.internal/health || echo "Smoke test failed, continuing anyway"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://production.orion.internal/health)
 
-      - name: Notify team
-        if: always()
-        run: echo "Deployment finished with status ${{ job.status }}"
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed"
+            exit 1
+          fi
 
-  lint:
-    runs-on: ubuntu-latest
-    needs: deploy
+          echo "Health check passed"
 
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '16'
-      - run: npm install
-      - run: npm run lint
+      - name: Smoke Test
+        run: |
+          curl -f http://production.orion.internal/health
 
-  test:
-    runs-on: ubuntu-latest
-    needs: lint
+      - name: Notify Success
+        if: success()
+        run: echo "Deployment Successful"
 
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '16'
-      - run: npm install
-      - run: npm test
+      - name: Rollback
+        if: failure()
+        run: |
+          echo "Deployment failed"
+          echo "Rolling back to previous version..."
