@@ -1,5 +1,5 @@
 const request = require('supertest');
-const app = require('../src/index');
+const app = require('../src/app');
 
 describe('POST /api/users', () => {
   it('should create user with valid data', async () => {
