@@ -3,63 +3,179 @@ name: Deploy Orion API
 on:
   push:
     branches:
-      - '*'
+      - main
+      - fix/pipeline
+
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  deploy:
+
+  # ---------------------------
+  # Stage 1: Source
+  # ---------------------------
+  source:
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Node
-        uses: actions/setup-node@v3
+      - name: Print Commit Information
+        run: |
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Timestamp: $(date)"
+
+  # ---------------------------
+  # Stage 2: Build
+  # ---------------------------
+  build:
+    needs: source
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
         with:
-          node-version: '16'
+          node-version: "16"
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install Dependencies
+        run: npm ci
 
-      - name: Deploy to production
+      - name: Build Application
+        run: npm run build
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-files
+          path: .
+
+  # ---------------------------
+  # Stage 3: Lint
+  # ---------------------------
+  lint:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - run: npm ci
+
+      - name: Run Lint
+        run: npm run lint
+
+  # ---------------------------
+  # Stage 4: Test
+  # ---------------------------
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - run: npm ci
+
+      - name: Run Tests
+        run: npm test
+
+  # ---------------------------
+  # Stage 5: Security
+  # ---------------------------
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - run: npm ci
+
+      - name: Dependency Audit
+        run: npm audit --audit-level=high
+
+  # ---------------------------
+  # Stage 6: Deploy Staging
+  # ---------------------------
+  deploy-staging:
+    needs: security
+    runs-on: ubuntu-latest
+
+    environment: staging
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-files
+
+      - name: Deploy to Staging
+        run: |
+          echo "Deploying to staging..."
+          bash scripts/deploy.sh
+
+  # ---------------------------
+  # Stage 7: Deploy Production
+  # ---------------------------
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+
+    environment: production
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-files
+
+      - name: Deploy to Production
         env:
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
           DB_PASS: ${{ secrets.DB_PASS }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
-          echo "Deploying version $APP_VERSION to production..."
+          echo "Deploying to production..."
           bash scripts/deploy.sh
 
-      - name: Run smoke test
+  # ---------------------------
+  # Stage 8: Verify
+  # ---------------------------
+  verify:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Smoke Test
         run: |
           sleep 5
-          curl -f http://production.orion.internal/health || echo "Smoke test failed, continuing anyway"
+          curl -f http://production.orion.internal/health
 
-      - name: Notify team
+      - name: Deployment Successful
+        if: success()
+        run: echo "Deployment verified successfully."
+
+      - name: Rollback
+        if: failure()
+        run: |
+          echo "Smoke test failed."
+          echo "Rolling back deployment..."
+          # rollback commands go here
+
+      - name: Notify Team
         if: always()
         run: echo "Deployment finished with status ${{ job.status }}"
-
-  lint:
-    runs-on: ubuntu-latest
-    needs: deploy
-
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '16'
-      - run: npm install
-      - run: npm run lint
-
-  test:
-    runs-on: ubuntu-latest
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '16'
-      - run: npm install
-      - run: npm test
